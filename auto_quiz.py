@@ -5,7 +5,7 @@ Hướng dẫn:
   1. Cài đặt:  pip install playwright && python -m playwright install chromium
   2. Điền thông tin cấu hình bên dưới (URL, tài khoản, XPath, dữ liệu câu hỏi)
   3. Chạy:     python auto_quiz.py
-  4. Script sẽ DỪNG sau khi trả lời xong – KHÔNG tự động submit.
+  4. Script sẽ tự động submit khi timer còn lại đến mốc AUTO_SUBMIT_AT (nếu cấu hình).
 
 Cách hoạt động:
   - Script dùng XPath template để quét từng câu hỏi trên trang
@@ -41,9 +41,15 @@ XPATH_BTN_LOGIN   = "/html/body/div/div[3]/div[2]/div[2]/form/button"
 
 # ── XPath trang kiểm tra ─────────────────────────────────────────────────────
 XPATH_BTN_NEXT    = "/html/body/div[1]/div[3]/form/div[2]/a/button"
-XPATH_BTN_SUBMIT  = "/html/body/div[1]/div[3]/form/div[4]/div/div[3]/input"  # KHÔNG click
+XPATH_BTN_SUBMIT  = "/html/body/div[1]/div[3]/form/div[4]/div/div[3]/input"
 XPATH_BTN_START   = ""  # Nút Bắt đầu (để trống nếu không có)
 XPATH_TIMER       = "/html/body/div[1]/div[3]/div[1]/div[2]/div/span"  # Timer đếm ngược (nếu có)
+
+# ── Tự động nộp bài ──────────────────────────────────────────────────────────
+# Khi timer còn lại <= mốc này thì tự động nhấn Submit.
+# Định dạng: "MM:SS" (ví dụ "01:30" = còn 1 phút 30 giây) hoặc "HH:MM:SS".
+# Để trống "" nếu không muốn tự động nộp.
+AUTO_SUBMIT_AT = os.getenv("AUTO_SUBMIT_AT", "01:30")
 
 # ── XPath Template cho câu hỏi & đáp án ──────────────────────────────────────
 # {q} = chỉ số câu hỏi trên trang (1, 2, 3...)
@@ -75,7 +81,7 @@ except Exception:
     QUESTIONS_DATA = []
 
 # ── Tuỳ chọn nâng cao ────────────────────────────────────────────────────────
-DELAY_BETWEEN_ACTIONS_MS = 50    # Thời gian chờ giữa các thao tác (ms)
+DELAY_BETWEEN_ACTIONS_MS = 0     # Thời gian chờ giữa các thao tác (ms) - Giảm xuống mức thấp nhất để tối đa tốc độ
 FUZZY_MATCH_THRESHOLD    = 0.70  # Ngưỡng so khớp mờ (0.0 → 1.0)
 QUESTIONS_JSON_FILE      = ""    # Đường dẫn file JSON (tùy chọn, ưu tiên hơn QUESTIONS_DATA)
 NAVIGATION_TIMEOUT_MS    = 30000 # Timeout điều hướng (ms)
@@ -128,18 +134,52 @@ def build_question_index(questions: list) -> list[tuple[str, dict]]:
     return [(normalize(item.get("question", "")), item) for item in questions]
 
 
+def parse_time_to_seconds(time_str: str) -> int | None:
+    """Chuyển chuỗi thời gian 'MM:SS' hoặc 'HH:MM:SS' thành tổng số giây. Trả về None nếu không hợp lệ."""
+    if not time_str or not time_str.strip():
+        return None
+    parts = time_str.strip().split(":")
+    try:
+        parts = [int(p) for p in parts]
+    except ValueError:
+        return None
+    if len(parts) == 2:
+        return parts[0] * 60 + parts[1]
+    elif len(parts) == 3:
+        return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    return None
+
+
 def get_remaining_time_text(page) -> str | None:
-    """Đọc text timer còn lại trên trang (vd: '12:34' hoặc '00:12:34')."""
+    """Đọc text timer còn lại trên trang (vd: '12:34' hoặc '00:12:34') bằng JS để tức thì và không bị nghẽn (non-blocking)."""
     if not XPATH_TIMER:
         return None
     try:
-        el = page.locator(f"xpath={XPATH_TIMER}").first
-        if el.count() == 0:
-            return None
-        txt = el.inner_text().strip()
+        txt = page.evaluate(f"""() => {{
+            const el = document.evaluate('{XPATH_TIMER}', document, null, 9, null).singleNodeValue;
+            return el ? el.innerText.trim() : null;
+        }}""")
         return txt or None
     except Exception:
         return None
+
+
+def do_auto_submit(page) -> bool:
+    """Click nút Submit. Trả về True nếu thành công."""
+    if not XPATH_BTN_SUBMIT:
+        print("  ⚠️  Không có XPATH_BTN_SUBMIT – không thể tự nộp bài.")
+        return False
+    try:
+        success = page.evaluate(f"""() => {{
+            const el = document.evaluate('{XPATH_BTN_SUBMIT}', document, null, 9, null).singleNodeValue;
+            if (!el) return false;
+            el.click();
+            return true;
+        }}""")
+        return bool(success)
+    except Exception as e:
+        print(f"  ⚠️  Lỗi khi nhấn Submit: {e}")
+        return False
 
 
 def find_matching_question(page_question_text: str, question_index: list[tuple[str, dict]]) -> dict | None:
@@ -231,21 +271,29 @@ def navigate_to_quiz(page):
 
 
 def click_next_button(page) -> bool:
-    """Click nút Next. Trả về True nếu thành công, False nếu không có / là nút Submit."""
+    """Click nút Next bằng 100% JS (siêu nhanh, không bị độ trễ check DOM của Playwright). Trả về True nếu thành công."""
     if not XPATH_BTN_NEXT:
         return False
     try:
-        next_btn = page.locator(f"xpath={XPATH_BTN_NEXT}")
-        if next_btn.count() == 0 or not next_btn.first.is_visible(timeout=800):
+        success = page.evaluate(f"""() => {{
+            const el = document.evaluate('{XPATH_BTN_NEXT}', document, null, 9, null).singleNodeValue;
+            if (!el) return false;
+            
+            const btn_text = (el.textContent || el.innerText || "").trim().toLowerCase();
+            if (btn_text.includes('submit') || btn_text.includes('nộp') || btn_text.includes('hoàn thành') || btn_text.includes('kết thúc')) {{
+                return false;
+            }}
+            
+            el.click();
+            return true;
+        }}""")
+        
+        if not success:
+            print(f"     ⏹️  Phát hiện nút Submit (hoặc không thấy nút Next) – DỪNG")
             return False
-
-        btn_text = next_btn.first.inner_text().strip().lower()
-        if any(kw in btn_text for kw in ["submit", "nộp", "hoàn thành", "kết thúc"]):
-            print(f"     ⏹️  Phát hiện nút Submit – DỪNG")
-            return False
-
-        next_btn.first.click(force=True)
-        page.wait_for_timeout(DELAY_BETWEEN_ACTIONS_MS)
+            
+        if DELAY_BETWEEN_ACTIONS_MS > 0:
+            page.wait_for_timeout(DELAY_BETWEEN_ACTIONS_MS)
         return True
     except Exception:
         return False
@@ -276,24 +324,27 @@ def answer_all_questions(page, questions: list) -> dict:
         print(f"  📌 Câu {q_idx}/{MAX_QUESTIONS_PER_PAGE}")
         print(f"{'─' * 50}")
 
-        # ── Đọc text câu hỏi ──
+        # ── Đọc text câu hỏi bằng JS ngay lập tức ──
         q_xpath = XPATH_QUESTION_TEXT.replace("{q}", str(q_idx))
         try:
-            q_el = page.locator(f"xpath={q_xpath}")
-            if q_el.count() == 0:
-                print(f"     ℹ️  Không tìm thấy câu hỏi – kết thúc.")
-                break
-            q_el = q_el.first
-            try:
-                q_el.scroll_into_view_if_needed()
-            except Exception:
-                pass
-            page_question_text = q_el.inner_text().strip()
+            page_question_text = page.evaluate("""async (xpath) => {
+                const sleep = ms => new Promise(r => setTimeout(r, ms));
+                for(let i=0; i<6; i++) { // Chờ tối đa 300ms nếu web tải chậm
+                    const el = document.evaluate(xpath, document, null, 9, null).singleNodeValue;
+                    if (el && (el.textContent || "").trim().length > 0) {
+                        try { if (el.scrollIntoViewIfNeeded) el.scrollIntoViewIfNeeded(); } catch(e){}
+                        return (el.textContent || "").trim();
+                    }
+                    await sleep(50);
+                }
+                return null;
+            }""", q_xpath)
         except Exception:
-            print(f"     ℹ️  Không đọc được câu hỏi – bỏ qua.")
-            if not click_next_button(page):
-                break
-            continue
+            page_question_text = None
+
+        if not page_question_text:
+            print(f"     ℹ️  Không tìm thấy câu hỏi – kết thúc.")
+            break
 
         if not page_question_text:
             if not click_next_button(page):
@@ -325,28 +376,34 @@ def answer_all_questions(page, questions: list) -> dict:
         norm_answer = normalize(expected_answer)
         print(f"     🔍 Đáp án cần tìm: \"{expected_answer[:60]}{'...' if len(expected_answer) > 60 else ''}\"")
 
-        # ── Đợi đáp án đầu tiên hiện ra ──
-        first_opt_xpath = XPATH_OPTION_TEXT.replace("{q}", str(q_idx)).replace("{a}", "1")
-        try:
-            page.locator(f"xpath={first_opt_xpath}").first.wait_for(state="visible", timeout=3000)
-        except Exception:
-            print(f"     ❌ Đáp án chưa hiện – BỎ QUA")
-            results["skipped"].append(page_question_text)
-            if not click_next_button(page):
-                break
-            continue
-
-        # ── Đọc tất cả đáp án 1 lần duy nhất bằng JS (nhanh hơn 3 lần gọi riêng) ──
+        # ── Đọc tất cả đáp án siêu nhanh bằng JS Asynchronous loop ──
         js_xpaths = [
             XPATH_OPTION_TEXT.replace("{q}", str(q_idx)).replace("{a}", str(i))
             for i in range(1, MAX_OPTIONS + 1)
         ]
-        option_texts = page.evaluate("""(xpaths) => {
-            return xpaths.map(xp => {
-                const el = document.evaluate(xp, document, null, 9, null).singleNodeValue;
-                return el ? el.innerText.trim() : "";
-            });
-        }""", js_xpaths)
+        
+        try:
+            option_texts = page.evaluate("""async (xpaths) => {
+                const sleep = ms => new Promise(r => setTimeout(r, ms));
+                for(let i=0; i<10; i++) { // Thử retry tối đa 500ms
+                    let texts = xpaths.map(xp => {
+                        const el = document.evaluate(xp, document, null, 9, null).singleNodeValue;
+                        return el ? (el.textContent || el.innerText || "").trim() : "";
+                    });
+                    if (texts.some(t => t.length > 0)) return texts;
+                    await sleep(50);
+                }
+                return [];
+            }""", js_xpaths)
+        except Exception:
+            option_texts = []
+            
+        if not any(option_texts):
+            print(f"     ❌ Đáp án trống (web chưa trả về) – BỎ QUA")
+            results["skipped"].append(page_question_text)
+            if not click_next_button(page):
+                break
+            continue
 
         # ── So khớp: ưu tiên exact → contains → fuzzy, chọn score cao nhất ──
         best_a_idx = -1
@@ -372,18 +429,22 @@ def answer_all_questions(page, questions: list) -> dict:
                 best_a_score = score
                 best_a_idx = a_idx
 
+            if best_a_score == 1.0:
+                break # Tìm thấy chuẩn xác 100%, thoát vòng lặp so sánh ngay để tăng vòng đời
+
         found = False
         if best_a_idx > 0 and best_a_score >= FUZZY_MATCH_THRESHOLD:
             if XPATH_OPTION_CLICK:
                 click_xpath = XPATH_OPTION_CLICK.replace("{q}", str(q_idx)).replace("{a}", str(best_a_idx))
-                click_el = page.locator(f"xpath={click_xpath}")
             else:
-                click_el = page.locator(
-                    f"xpath={XPATH_OPTION_TEXT.replace('{q}', str(q_idx)).replace('{a}', str(best_a_idx))}"
-                )
+                click_xpath = XPATH_OPTION_TEXT.replace("{q}", str(q_idx)).replace("{a}", str(best_a_idx))
 
             try:
-                click_el.first.click(force=True)
+                # Dùng thuộc tính JS click để qua mặt Playwright pipeline click -> Không có độ trễ hiển thị
+                page.evaluate(f"""(xpath) => {{
+                    const el = document.evaluate(xpath, document, null, 9, null).singleNodeValue;
+                    if (el) el.click();
+                }}""", click_xpath)
                 found = True
                 answered_set.add(q_key)
                 print(f"     ✅ Đã chọn đáp án [{best_a_idx}] (score: {best_a_score:.0%})")
@@ -405,7 +466,7 @@ def answer_all_questions(page, questions: list) -> dict:
     return results
 
 
-def print_report(results: dict, remaining_time: str | None = None):
+def print_report(results: dict):
     """Bước 5 – In báo cáo kết quả."""
     skipped_count = len(results["skipped"])
     total_on_exam = results["answered"] + skipped_count
@@ -417,8 +478,6 @@ def print_report(results: dict, remaining_time: str | None = None):
     print(f"  Câu hỏi xuất hiện trên đề: {total_on_exam}")
     print(f"  Đã trả lời thành công   : {results['answered']}")
     print(f"  Không có trong data/đáp án: {skipped_count}")
-    if remaining_time:
-        print(f"  ⏱️  Thời gian còn lại     : {remaining_time}")
 
     if results["skipped"]:
         print(f"  Câu bị bỏ qua           :")
@@ -427,8 +486,6 @@ def print_report(results: dict, remaining_time: str | None = None):
             print(f"    • {sq_short}")
 
     print("  ══════════════════════════════════════")
-    print("  ⏳ Vui lòng kiểm tra lại và nhấn Submit khi sẵn sàng.")
-    print("  🔴 Đóng trình duyệt hoặc nhấn Ctrl+C để thoát.\n")
 
 
 def main():
@@ -455,25 +512,73 @@ def main():
             do_login(page)
             navigate_to_quiz(page)
             results = answer_all_questions(page, questions)
-            remaining_time = get_remaining_time_text(page)
-            print_report(results, remaining_time=remaining_time)
+            print_report(results)
 
-            print("  💡 Trình duyệt đang mở. Nhấn Ctrl+C để thoát.")
+            print("  💡 Trình duyệt đang mở để bạn kiểm tra lại đáp án.")
+
+            # ── Tính toán mốc auto-submit ──
+            auto_submit_seconds = parse_time_to_seconds(AUTO_SUBMIT_AT)
+            if auto_submit_seconds is not None:
+                print(f"  ⏱️  Auto-submit được BẬT: sẽ tự nộp bài khi timer còn ≤ {AUTO_SUBMIT_AT}")
+            else:
+                print("  ⏳ Auto-submit TẮT. Vui lòng tự nhấn 'Submit/Nộp bài' khi sẵn sàng.")
+            
+            last_time = None
+            is_submitted = False
+            
             try:
                 while True:
-                    time.sleep(1)
+                    try:
+                        if page.is_closed():
+                            break
+                        
+                        current_time = get_remaining_time_text(page)
+                        if current_time:
+                            last_time = current_time
+
+                            # ── Kiểm tra auto-submit ──
+                            if not is_submitted and auto_submit_seconds is not None:
+                                remaining_secs = parse_time_to_seconds(current_time)
+                                if remaining_secs is not None and remaining_secs <= auto_submit_seconds:
+                                    print(f"\n  ⏰ Timer còn {current_time} (≤ {AUTO_SUBMIT_AT}) → TỰ ĐỘNG NỘP BÀI!")
+                                    if do_auto_submit(page):
+                                        print("  ✅ Đã nhấn nút Submit thành công!")
+                                        is_submitted = True
+                                        # Chờ trang xử lý
+                                        try:
+                                            page.wait_for_load_state("domcontentloaded", timeout=10000)
+                                        except Exception:
+                                            pass
+                                    else:
+                                        print("  ❌ Không nhấn được nút Submit – thử lại sau 2 giây...")
+                                        time.sleep(2)
+                                        continue
+                        else:
+                            # Không thấy timer nữa
+                            if not is_submitted and last_time:
+                                print(f"\n  🚀 ĐÃ NỘP BÀI! Thời gian hệ thống ghi nhận lúc nộp: {last_time}")
+                                is_submitted = True
+                    except Exception as loop_e:
+                        if "Target closed" in str(loop_e) or "Browser.close" in str(loop_e) or "Target page, context" in str(loop_e):
+                            break
+                        
+                    time.sleep(0.5)
             except KeyboardInterrupt:
                 print("\n  👋 Đang đóng trình duyệt...")
 
         except Exception as e:
-            print(f"\n❌ LỖI: {e}")
-            import traceback
-            traceback.print_exc()
-            print("\n  Trình duyệt vẫn mở để kiểm tra.")
-            try:
-                input("  Nhấn Enter để đóng...")
-            except (KeyboardInterrupt, EOFError):
-                pass
+            # Ngăn lỗi lộn xộn đỏ màn hình khi người dùng đóng trình duyệt bằng tay bằng (nút X)
+            if "Target closed" in str(e) or "Browser.close" in str(e) or "Target page, context" in str(e) or "Connection closed" in str(e):
+                print("\n  👋 Bạn đã đóng trình duyệt.")
+            else:
+                print(f"\n❌ LỖI: {e}")
+                import traceback
+                traceback.print_exc()
+                print("\n  Trình duyệt vẫn mở để kiểm tra.")
+                try:
+                    input("  Nhấn Enter để đóng...")
+                except (KeyboardInterrupt, EOFError):
+                    pass
 
         finally:
             context.close()
